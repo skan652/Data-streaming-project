@@ -4,7 +4,7 @@ services:
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
-    container_name: zookeeper
+    container_name: zookeeper-fixed
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -16,7 +16,7 @@ services:
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
-    container_name: kafka
+    container_name: kafka-fixed
     depends_on:
       zookeeper:
         condition: service_healthy
@@ -42,7 +42,7 @@ services:
     build:
       context: .
       dockerfile: producer/Dockerfile
-    container_name: weather-producer
+    container_name: weather-producer-fixed
     depends_on:
       kafka:
         condition: service_healthy
@@ -57,7 +57,7 @@ services:
     build:
       context: .
       dockerfile: spark/Dockerfile
-    container_name: spark-streaming
+    container_name: spark-streaming-fixed
     depends_on:
       kafka:
         condition: service_healthy
@@ -76,7 +76,7 @@ services:
     build:
       context: .
       dockerfile: dashboard/Dockerfile
-    container_name: weather-dashboard
+    container_name: weather-dashboard-fixed
     depends_on:
       - spark-streaming
     ports:
