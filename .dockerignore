@@ -1,0 +1,25 @@
+# Version control
+.git
+.gitignore
+
+# Secrets – never bake into an image
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Generated runtime artifacts (mounted as a volume at runtime)
+spark/model/
+spark/output/
+spark/spark/
+
+# Tooling / IDE
+.vscode/
+.idea/
+.ruff_cache/
+.mypy_cache/
+
+# Docs / misc
+README.md
+.env.example

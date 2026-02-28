@@ -1,253 +1,502 @@
-# dashboard/app_pyspark.py
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from pyspark.sql import SparkSession
+"""
+dashboard/app.py
+----------------
+Streamlit dashboard that auto-refreshes to display real-time weather data,
+ML temperature predictions and windowed aggregations written by the Spark job.
+
+Data is read from two rolling JSON-lines files:
+  - ``{OUTPUT_PATH}/predictions.json``  – per-event ML predictions
+  - ``{OUTPUT_PATH}/aggregations.json`` – 5-minute windowed statistics
+"""
+
+from __future__ import annotations
+
+import logging
+import os
 import time
 from datetime import datetime
-import threading
+from typing import Optional
 
-# Page config
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from dotenv import load_dotenv
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Load .env file when running locally; no-op inside Docker (vars already injected)
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+OUTPUT_DIR: str = os.environ.get("OUTPUT_PATH", "/opt/spark-apps/output")
+PREDICTIONS_FILE: str = os.path.join(OUTPUT_DIR, "predictions.json")
+AGGREGATIONS_FILE: str = os.path.join(OUTPUT_DIR, "aggregations.json")
+
+TIMESTAMP_COL: str = "timestamp_readable"
+WINDOW_END_COL: str = "window_end"
+
+# Colour palette (consistent across charts)
+COLOR_ACTUAL: str = "#e74c3c"
+COLOR_PREDICTED: str = "#3498db"
+COLOR_HUMIDITY: str = "#2ecc71"
+COLOR_PRESSURE: str = "#9b59b6"
+COLOR_ERROR: str = "#e67e22"
+COLOR_WIND: str = "#3498db"
+
+CHART_HEIGHT: int = 380
+AGG_CHART_HEIGHT: int = 350
+
+# ---------------------------------------------------------------------------
+# Page configuration (must be the first Streamlit call)
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Weather Streaming Dashboard",
-    page_icon="🌤️",
-    layout="wide"
+    page_icon="🌤",
+    layout="wide",
 )
 
-# Initialize Spark session
-@st.cache_resource
-def get_spark_session():
-    return SparkSession.builder \
-        .appName("WeatherDashboard") \
-        .config("spark.sql.streaming.checkpointLocation", "/tmp/dashboard_checkpoint") \
-        .config("spark.driver.host", "localhost") \
-        .getOrCreate()
+# ---------------------------------------------------------------------------
+# Cached data loaders
+# ---------------------------------------------------------------------------
 
-spark = get_spark_session()
+@st.cache_data(ttl=5)
+def load_predictions() -> pd.DataFrame:
+    """Read the latest prediction records from the JSON-lines file.
 
-# Title
-st.title("🌤️ Real-Time Weather Streaming Dashboard")
-st.markdown("---")
+    Returns:
+        Sorted DataFrame of weather predictions, or an empty DataFrame
+        if the file does not exist or cannot be parsed.
+    """
+    if not os.path.exists(PREDICTIONS_FILE):
+        return pd.DataFrame()
+    try:
+        df = pd.read_json(PREDICTIONS_FILE, lines=True)
+        if TIMESTAMP_COL in df.columns:
+            df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL], errors="coerce")
+            df = df.sort_values(TIMESTAMP_COL)
+        return df
+    except ValueError as exc:
+        logger.error("Failed to parse predictions file: %s", exc)
+        return pd.DataFrame()
 
-# Sidebar
-st.sidebar.header("Controls")
-refresh_rate = st.sidebar.slider("Refresh Rate (seconds)", 1, 10, 2)
-show_raw_data = st.sidebar.checkbox("Show Raw Data", False)
 
-# Main layout
-col1, col2, col3, col4 = st.columns(4)
+@st.cache_data(ttl=5)
+def load_aggregations() -> pd.DataFrame:
+    """Read the latest windowed aggregations from the JSON-lines file.
 
-# Placeholders for metrics
-metric_placeholders = {
-    'temp': col1.empty(),
-    'pred_temp': col2.empty(),
-    'humidity': col3.empty(),
-    'wind': col4.empty()
-}
+    Returns:
+        Sorted DataFrame of aggregated statistics, or an empty DataFrame
+        if the file does not exist or cannot be parsed.
+    """
+    if not os.path.exists(AGGREGATIONS_FILE):
+        return pd.DataFrame()
+    try:
+        df = pd.read_json(AGGREGATIONS_FILE, lines=True)
+        for col_name in ("window_start", WINDOW_END_COL):
+            if col_name in df.columns:
+                df[col_name] = pd.to_datetime(df[col_name], errors="coerce")
+        if WINDOW_END_COL in df.columns:
+            df = df.sort_values(WINDOW_END_COL)
+        return df
+    except ValueError as exc:
+        logger.error("Failed to parse aggregations file: %s", exc)
+        return pd.DataFrame()
 
-# Charts
-chart_col1, chart_col2 = st.columns(2)
-temp_chart = chart_col1.empty()
-error_chart = chart_col2.empty()
 
-agg_chart1, agg_chart2 = st.columns(2)
-hourly_temp_chart = agg_chart1.empty()
-weather_dist_chart = agg_chart2.empty()
+# ---------------------------------------------------------------------------
+# Chart builders
+# ---------------------------------------------------------------------------
 
-# Raw data table
-raw_data_table = st.empty()
+def build_temperature_chart(df: pd.DataFrame) -> go.Figure:
+    """Build a dual line chart: actual vs. ML-predicted temperature.
 
-# Status
-status_text = st.empty()
+    Args:
+        df: Predictions DataFrame with ``temperature`` and
+            ``predicted_temperature`` columns.
 
-def update_dashboard():
-    """Update dashboard with latest data"""
-    last_update = time.time()
-    
-    while True:
-        try:
-            # Check if tables exist
-            tables = [row.tableName for row in spark.catalog.listTables()]
-            
-            if 'current_weather' in tables:
-                # Query current weather data
-                current_df = spark.sql("""
-                    SELECT 
-                        timestamp_readable,
-                        city,
-                        temperature,
-                        predicted_temperature,
-                        temperature_error,
-                        humidity,
-                        weather,
-                        wind_speed
-                    FROM current_weather 
-                    ORDER BY timestamp_readable DESC 
-                    LIMIT 1
-                """).toPandas()
-                
-                # Query all current data
-                all_current_df = spark.sql("""
-                    SELECT * FROM current_weather 
-                    ORDER BY timestamp_readable DESC 
-                    LIMIT 50
-                """).toPandas()
-                
-                # Update metrics
-                if not current_df.empty:
-                    row = current_df.iloc[0]
-                    
-                    metric_placeholders['temp'].metric(
-                        "Actual Temperature",
-                        f"{row['temperature']:.1f}°C"
-                    )
-                    
-                    metric_placeholders['pred_temp'].metric(
-                        "Predicted Temperature",
-                        f"{row['predicted_temperature']:.1f}°C",
-                        f"Error: {row['temperature_error']:.1f}°C"
-                    )
-                    
-                    metric_placeholders['humidity'].metric(
-                        "Humidity",
-                        f"{row['humidity']:.0f}%"
-                    )
-                    
-                    metric_placeholders['wind'].metric(
-                        "Wind Speed",
-                        f"{row['wind_speed']:.1f} m/s"
-                    )
-                
-                # Update temperature comparison chart
-                if not all_current_df.empty:
-                    fig_temp = go.Figure()
-                    fig_temp.add_trace(go.Scatter(
-                        x=all_current_df['timestamp_readable'],
-                        y=all_current_df['temperature'],
-                        mode='lines+markers',
-                        name='Actual Temperature',
-                        line=dict(color='red', width=2)
-                    ))
-                    fig_temp.add_trace(go.Scatter(
-                        x=all_current_df['timestamp_readable'],
-                        y=all_current_df['predicted_temperature'],
-                        mode='lines+markers',
-                        name='Predicted Temperature',
-                        line=dict(color='blue', width=2, dash='dash')
-                    ))
-                    fig_temp.update_layout(
-                        title="Temperature: Actual vs Predicted",
-                        xaxis_title="Time",
-                        yaxis_title="Temperature (°C)",
-                        height=400,
-                        hovermode='x unified'
-                    )
-                    temp_chart.plotly_chart(fig_temp, use_container_width=True)
-                    
-                    # Prediction error chart
-                    fig_error = go.Figure()
-                    fig_error.add_trace(go.Bar(
-                        x=all_current_df['timestamp_readable'],
-                        y=all_current_df['temperature_error'],
-                        name='Prediction Error',
-                        marker_color='orange',
-                        opacity=0.7
-                    ))
-                    fig_error.update_layout(
-                        title="Temperature Prediction Error",
-                        xaxis_title="Time",
-                        yaxis_title="Error (°C)",
-                        height=400,
-                        yaxis_range=[0, all_current_df['temperature_error'].max() * 1.1]
-                    )
-                    error_chart.plotly_chart(fig_error, use_container_width=True)
-                    
-                    # Weather distribution
-                    weather_counts = all_current_df['weather'].value_counts()
-                    if not weather_counts.empty:
-                        fig_pie = px.pie(
-                            values=weather_counts.values,
-                            names=weather_counts.index,
-                            title="Weather Conditions Distribution",
-                            color_discrete_sequence=px.colors.qualitative.Set3
-                        )
-                        weather_dist_chart.plotly_chart(fig_pie, use_container_width=True)
-                
-                # Query aggregates if available
-                if 'weather_aggregates' in tables:
-                    agg_df = spark.sql("""
-                        SELECT 
-                            window.end as window_end,
-                            avg_temperature,
-                            avg_predicted_temperature,
-                            avg_prediction_error,
-                            readings_count
-                        FROM weather_aggregates 
-                        ORDER BY window_end DESC 
-                        LIMIT 10
-                    """).toPandas()
-                    
-                    if not agg_df.empty:
-                        fig_agg = go.Figure()
-                        fig_agg.add_trace(go.Scatter(
-                            x=agg_df['window_end'],
-                            y=agg_df['avg_temperature'],
-                            mode='lines+markers',
-                            name='Avg Temperature',
-                            line=dict(color='red')
-                        ))
-                        fig_agg.add_trace(go.Scatter(
-                            x=agg_df['window_end'],
-                            y=agg_df['avg_predicted_temperature'],
-                            mode='lines+markers',
-                            name='Avg Predicted',
-                            line=dict(color='blue', dash='dash')
-                        ))
-                        fig_agg.update_layout(
-                            title="5-Minute Average Temperature",
-                            xaxis_title="Time",
-                            yaxis_title="Temperature (°C)",
-                            height=400
-                        )
-                        hourly_temp_chart.plotly_chart(fig_agg, use_container_width=True)
-                
-                # Show raw data
-                if show_raw_data and not all_current_df.empty:
-                    display_df = all_current_df[['timestamp_readable', 'temperature', 
-                                                'predicted_temperature', 'temperature_error',
-                                                'humidity', 'weather', 'wind_speed']]
-                    raw_data_table.dataframe(
-                        display_df,
-                        use_container_width=True,
-                        height=300
-                    )
-                
-                # Update status
-                status_text.success(f"✅ Last update: {datetime.now().strftime('%H:%M:%S')} | "
-                                   f"Records: {len(all_current_df)}")
-            
-            time.sleep(refresh_rate)
-            
-        except Exception as e:
-            status_text.error(f"❌ Error: {e}")
-            time.sleep(refresh_rate)
+    Returns:
+        A configured Plotly Figure.
+    """
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df[TIMESTAMP_COL],
+            y=df["temperature"],
+            mode="lines+markers",
+            name="Actual",
+            line=dict(color=COLOR_ACTUAL, width=2),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df[TIMESTAMP_COL],
+            y=df["predicted_temperature"],
+            mode="lines+markers",
+            name="RF Predicted",
+            line=dict(color=COLOR_PREDICTED, width=2, dash="dash"),
+        )
+    )
+    # Overlay anomaly markers (IsolationForest detections)
+    if "is_anomaly" in df.columns:
+        anomalies = df[df["is_anomaly"] == 1]
+        if not anomalies.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=anomalies[TIMESTAMP_COL],
+                    y=anomalies["temperature"],
+                    mode="markers",
+                    name="Anomaly",
+                    marker=dict(
+                        color="#e74c3c",
+                        symbol="x",
+                        size=14,
+                        line=dict(color="black", width=1),
+                    ),
+                )
+            )
+    fig.update_layout(
+        title="🌡 Temperature – Actual vs ML Prediction",
+        xaxis_title="Time",
+        yaxis_title="°C",
+        legend=dict(orientation="h"),
+        height=CHART_HEIGHT,
+        hovermode="x unified",
+    )
+    return fig
 
-# Start dashboard update thread
-if 'dashboard_running' not in st.session_state:
-    st.session_state.dashboard_running = True
-    thread = threading.Thread(target=update_dashboard, daemon=True)
-    thread.start()
 
-# Instructions
-st.markdown("---")
-st.markdown("""
-### 📊 Dashboard Information
-- **Data Source**: Real-time weather data from OpenWeather API
-- **ML Model**: Random Forest Regressor (PySpark ML)
-- **Features**: Humidity, Pressure, Wind Speed, Clouds, Time features, Weather condition
-- **Update Frequency**: Every {} seconds
-- **Streaming Engine**: Apache Spark Structured Streaming
+def build_error_chart(df: pd.DataFrame) -> go.Figure:
+    """Build a bar chart of absolute temperature prediction error.
 
-*Waiting for data... The dashboard will update automatically when data arrives.*
-""".format(refresh_rate))
+    Args:
+        df: Predictions DataFrame with a ``temperature_error`` column.
+
+    Returns:
+        A configured Plotly Figure.
+    """
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=df[TIMESTAMP_COL],
+            y=df["temperature_error"],
+            name="Prediction Error",
+            marker_color=COLOR_ERROR,
+            opacity=0.75,
+        )
+    )
+    fig.update_layout(
+        title="📉 Prediction Error (|Actual − Predicted|)",
+        xaxis_title="Time",
+        yaxis_title="°C",
+        height=CHART_HEIGHT,
+    )
+    return fig
+
+
+def build_humidity_pressure_chart(df: pd.DataFrame) -> go.Figure:
+    """Build a dual-axis chart for humidity (left) and pressure (right).
+
+    Args:
+        df: Predictions DataFrame.
+
+    Returns:
+        A configured Plotly Figure.
+    """
+    fig = go.Figure()
+    if "humidity" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df[TIMESTAMP_COL],
+                y=df["humidity"],
+                mode="lines+markers",
+                name="Humidity (%)",
+                line=dict(color=COLOR_HUMIDITY),
+            )
+        )
+    if "pressure" in df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=df[TIMESTAMP_COL],
+                y=df["pressure"],
+                mode="lines+markers",
+                name="Pressure (hPa)",
+                line=dict(color=COLOR_PRESSURE),
+                yaxis="y2",
+            )
+        )
+    fig.update_layout(
+        title="💧 Humidity & Pressure Over Time",
+        yaxis=dict(title="Humidity (%)"),
+        yaxis2=dict(title="Pressure (hPa)", overlaying="y", side="right"),
+        legend=dict(orientation="h"),
+        height=CHART_HEIGHT,
+    )
+    return fig
+
+
+def build_windowed_temp_chart(agg_df: pd.DataFrame) -> go.Figure:
+    """Build a line chart showing windowed avg/min/max temperature.
+
+    Args:
+        agg_df: Aggregations DataFrame.
+
+    Returns:
+        A configured Plotly Figure.
+    """
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=agg_df[WINDOW_END_COL],
+            y=agg_df["avg_temperature"],
+            mode="lines+markers",
+            name="Avg Temp",
+            line=dict(color=COLOR_ACTUAL),
+        )
+    )
+    if "max_temperature" in agg_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=agg_df[WINDOW_END_COL],
+                y=agg_df["max_temperature"],
+                mode="lines",
+                name="Max Temp",
+                line=dict(color=COLOR_ACTUAL, dash="dot"),
+            )
+        )
+    if "min_temperature" in agg_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=agg_df[WINDOW_END_COL],
+                y=agg_df["min_temperature"],
+                mode="lines",
+                name="Min Temp",
+                line=dict(color=COLOR_PREDICTED, dash="dot"),
+                fill="tonexty",
+                fillcolor="rgba(52,152,219,0.1)",
+            )
+        )
+    fig.update_layout(
+        title="🌡 Windowed Avg / Min / Max Temperature",
+        xaxis_title="Window End",
+        yaxis_title="°C",
+        legend=dict(orientation="h"),
+        height=AGG_CHART_HEIGHT,
+    )
+    return fig
+
+
+def build_windowed_humidity_wind_chart(agg_df: pd.DataFrame) -> go.Figure:
+    """Build a grouped bar chart for windowed humidity and wind speed.
+
+    Args:
+        agg_df: Aggregations DataFrame.
+
+    Returns:
+        A configured Plotly Figure.
+    """
+    fig = go.Figure()
+    if "avg_humidity" in agg_df.columns:
+        fig.add_trace(
+            go.Bar(
+                x=agg_df[WINDOW_END_COL],
+                y=agg_df["avg_humidity"],
+                name="Avg Humidity (%)",
+                marker_color=COLOR_HUMIDITY,
+            )
+        )
+    if "avg_wind_speed" in agg_df.columns:
+        fig.add_trace(
+            go.Bar(
+                x=agg_df[WINDOW_END_COL],
+                y=agg_df["avg_wind_speed"],
+                name="Avg Wind (m/s)",
+                marker_color=COLOR_WIND,
+            )
+        )
+    fig.update_layout(
+        title="💨 Windowed Avg Humidity & Wind Speed",
+        xaxis_title="Window End",
+        barmode="group",
+        height=AGG_CHART_HEIGHT,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Dashboard layout
+# ---------------------------------------------------------------------------
+
+def render_kpi_row(latest: pd.Series) -> None:
+    """Render the top-row KPI metric cards.
+
+    Args:
+        latest: A single row from the predictions DataFrame (the most recent).
+    """
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+    # Use None-safe retrieval so N/A is shown when data is missing
+    temperature: Optional[float] = latest.get("temperature")
+    predicted: Optional[float] = latest.get("predicted_temperature")
+    error: Optional[float] = latest.get("temperature_error")
+    humidity: Optional[float] = latest.get("humidity")
+    wind_speed: Optional[float] = latest.get("wind_speed")
+    cloud_cover: Optional[float] = latest.get("clouds")
+    is_anomaly: Optional[int] = latest.get("is_anomaly")
+
+    col1.metric(
+        "🌡 Temperature",
+        f"{temperature:.1f} °C" if temperature is not None else "N/A",
+    )
+    col2.metric(
+        "🔮 Predicted Temp",
+        f"{predicted:.1f} °C" if predicted is not None else "N/A",
+        delta=f"err {error:.1f} °C" if error is not None else None,
+        delta_color="inverse",
+    )
+    col3.metric(
+        "💧 Humidity",
+        f"{humidity:.0f} %" if humidity is not None else "N/A",
+    )
+    col4.metric(
+        "🌬 Wind Speed",
+        f"{wind_speed:.1f} m/s" if wind_speed is not None else "N/A",
+    )
+    col5.metric(
+        "☁ Cloud Cover",
+        f"{cloud_cover:.0f} %" if cloud_cover is not None else "N/A",
+    )
+    col6.metric(
+        "🔍 Anomaly",
+        "⚠ Detected" if is_anomaly == 1 else ("✅ Normal" if is_anomaly == 0 else "N/A"),
+    )
+
+
+def render_main_dashboard() -> None:
+    """Render the full dashboard layout."""
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.title("🌤 Real-Time Weather Streaming Dashboard")
+    st.caption(
+        "OpenWeather API  |  Kafka  |  "
+        "Spark Structured Streaming  |  Random Forest + Isolation Forest"
+    )
+    st.markdown("---")
+
+    # ── Sidebar controls ──────────────────────────────────────────────────────
+    st.sidebar.header("Controls")
+    refresh_rate: int = st.sidebar.slider("Auto-refresh (seconds)", 5, 60, 10)
+    n_points: int = st.sidebar.slider("Points to display", 10, 100, 50)
+    show_raw: bool = st.sidebar.checkbox("Show raw data table", value=False)
+    st.sidebar.markdown(f"**Output dir:** `{OUTPUT_DIR}`")
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    predictions_df = load_predictions()
+    aggregations_df = load_aggregations()
+
+    if predictions_df.empty:
+        st.warning(
+            f"⏳ Waiting for data from `{PREDICTIONS_FILE}`.  \n"
+            "Make sure the Kafka producer and Spark streaming job are running."
+        )
+        time.sleep(refresh_rate)
+        st.rerun()
+
+    predictions_df = predictions_df.tail(n_points)
+    latest_row: pd.Series = predictions_df.iloc[-1]
+
+    # ── KPI metrics ───────────────────────────────────────────────────────────
+    render_kpi_row(latest_row)
+    st.markdown("---")
+
+    # ── Row 1: Temperature actual vs predicted  |  Prediction error ───────────
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.plotly_chart(
+            build_temperature_chart(predictions_df), use_container_width=True
+        )
+    with right_col:
+        st.plotly_chart(
+            build_error_chart(predictions_df), use_container_width=True
+        )
+
+    # ── Row 2: Humidity & Pressure  |  Weather distribution ───────────────────
+    left_col, right_col = st.columns(2)
+    with left_col:
+        st.plotly_chart(
+            build_humidity_pressure_chart(predictions_df), use_container_width=True
+        )
+    with right_col:
+        if "weather" in predictions_df.columns and not predictions_df["weather"].dropna().empty:
+            condition_counts = predictions_df["weather"].value_counts()
+            weather_pie = px.pie(
+                values=condition_counts.values,
+                names=condition_counts.index,
+                title="☁ Weather Conditions Distribution",
+                color_discrete_sequence=px.colors.qualitative.Pastel,
+                hole=0.35,
+            )
+            weather_pie.update_layout(height=CHART_HEIGHT)
+            st.plotly_chart(weather_pie, use_container_width=True)
+
+    # ── Row 3: Windowed aggregations ──────────────────────────────────────────
+    if not aggregations_df.empty:
+        st.markdown("---")
+        st.subheader("📊 5-Minute Windowed Aggregations (Spark Structured Streaming)")
+        left_col, right_col = st.columns(2)
+        with left_col:
+            st.plotly_chart(
+                build_windowed_temp_chart(aggregations_df), use_container_width=True
+            )
+        with right_col:
+            st.plotly_chart(
+                build_windowed_humidity_wind_chart(aggregations_df),
+                use_container_width=True,
+            )
+
+    # ── Raw data table ────────────────────────────────────────────────────────
+    if show_raw:
+        st.markdown("---")
+        st.subheader("📋 Raw Data")
+        display_columns = [
+            TIMESTAMP_COL,
+            "temperature",
+            "predicted_temperature",
+            "temperature_error",
+            "humidity",
+            "pressure",
+            "weather",
+            "wind_speed",
+            "clouds",
+        ]
+        display_df = predictions_df[
+            [c for c in display_columns if c in predictions_df.columns]
+        ].copy()
+        display_df[TIMESTAMP_COL] = display_df[TIMESTAMP_COL].astype(str)
+        st.dataframe(display_df, use_container_width=True, height=300)
+
+    # ── Footer & auto-refresh ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.caption(
+        f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  "
+        f"Records: {len(predictions_df)}  |  "
+        f"Auto-refresh: every {refresh_rate}s"
+    )
+
+    time.sleep(refresh_rate)
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+render_main_dashboard()
