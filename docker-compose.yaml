@@ -12,14 +12,15 @@ services:
       test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
+    restart: on-failure
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka-fixed
     depends_on:
-      zookeeper:
-        condition: service_healthy
+      - zookeeper
     ports:
       - "9092:9092"
       - "29092:29092"
@@ -32,11 +33,13 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: on-failure
     healthcheck:
-      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
+      test: ["CMD", "bash", "-c", "nc -z localhost 9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
 
   producer:
     build:
@@ -44,8 +47,7 @@ services:
       dockerfile: producer/Dockerfile
     container_name: weather-producer-fixed
     depends_on:
-      kafka:
-        condition: service_healthy
+      - kafka
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY}
@@ -59,8 +61,7 @@ services:
       dockerfile: spark/Dockerfile
     container_name: spark-streaming-fixed
     depends_on:
-      kafka:
-        condition: service_healthy
+      - kafka
     ports:
       - "4040:4040"
     volumes:
